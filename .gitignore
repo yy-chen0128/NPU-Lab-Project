@@ -18,6 +18,7 @@ base_checkpoints/
 *.pth
 *.safetensors
 wandb/
+torch_compile_debug/
 
 # 实验报告 / 提交物 / 截图：只跟踪代码，这些不进仓库
 实验报告*
