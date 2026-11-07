@@ -1,0 +1,28 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.pytest_cache/
+
+# 训练产物 / 缓存
+runs/*.log
+scaling_results.jsonl
+base_checkpoints/
+*.pt
+*.pth
+*.safetensors
+
+# 云盘大包与归档（用 runs/fetch_data.sh 下载，不进仓库）
+data/packed/
+*.tar
+*.tar.gz
+*.zip
+
+# 编辑器
+.vscode/
+.idea/
