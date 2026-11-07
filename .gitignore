@@ -19,6 +19,7 @@ base_checkpoints/
 
 # 云盘大包与归档（用 runs/fetch_data.sh 下载，不进仓库）
 data/packed/
+data/corpus_parquet/
 *.tar
 *.tar.gz
 *.zip
