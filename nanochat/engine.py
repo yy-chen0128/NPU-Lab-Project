@@ -138,7 +138,31 @@ class KVCache:
         #   * torch.repeat_interleave 或 .repeat 都行，注意维度顺序
         #   * 复制的是**已经算好的** KV，所以这一步不做任何矩阵运算（很便宜）
         #   * 复制后各样本共享同一段 prompt 的 cache，但后续写入互不影响
-        raise NotImplementedError("核心任务 6：KVCache.prefill")
+        pos = other.get_pos()
+        assert self.get_pos() == 0 and self.prev_embedding is None, (
+            "prefill 只能写入空的 cache（target cache 必须为空）")
+        assert other.batch_size <= self.batch_size, (
+            f"源 batch {other.batch_size} 大于目标 batch {self.batch_size}")
+        assert self.batch_size % other.batch_size == 0, (
+            "目标 batch 必须是源 batch 的整数倍")
+        grow = self.batch_size // other.batch_size
+
+        for layer_idx in range(self.n_layers):
+            k_dst, v_dst = self.get_layer_cache(layer_idx)
+            k_src, v_src = other.get_layer_cache(layer_idx)
+            if grow == 1:
+                k_dst[:, :pos] = k_src[:, :pos]
+                v_dst[:, :pos] = v_src[:, :pos]
+            else:
+                k_dst[:, :pos] = k_src[:, :pos].repeat_interleave(grow, dim=0)
+                v_dst[:, :pos] = v_src[:, :pos].repeat_interleave(grow, dim=0)
+
+        self.cache_seqlens.fill_(pos)
+        if other.prev_embedding is not None:
+            prev = other.prev_embedding
+            if grow != 1:
+                prev = prev.repeat_interleave(grow, dim=0)
+            self.prev_embedding = prev.clone()
 # -----------------------------------------------------------------------------
 @torch.inference_mode()
 def sample_next_token(logits, rng, temperature=1.0, top_k=None):
@@ -160,7 +184,25 @@ def sample_next_token(logits, rng, temperature=1.0, top_k=None):
     #     温度很低（<0.3）时容易复读。扫温度画"复读率 vs 跑偏率"曲线
     #     是 docs/03_思考题.md 第 6 题
     #   * top_k 的有效范围要 clamp 到 V，别让 topk 报错
-    raise NotImplementedError("基础任务 4：采样式生成")
+    if logits.dim() == 1:
+        logits = logits.unsqueeze(0)
+
+    if temperature == 0:
+        return logits.argmax(dim=-1, keepdim=True)
+
+    logits = logits / temperature
+    if top_k is not None and int(top_k) > 0:
+        k = min(int(top_k), logits.size(-1))
+        if k == 1:
+            return logits.argmax(dim=-1, keepdim=True)
+        kth = torch.topk(logits, k, dim=-1).values[..., -1, None]
+        logits = torch.where(
+            logits < kth,
+            torch.full_like(logits, float("-inf")),
+            logits)
+
+    probs = F.softmax(logits, dim=-1)
+    return torch.multinomial(probs, num_samples=1, generator=rng)
 # -----------------------------------------------------------------------------
 
 class RowState:
@@ -200,7 +242,53 @@ class Engine:
         # 建议的推进顺序（这段代码比较长，别想一次写对）：
         #   先跑通 batch=1、num_samples=1、不带滑窗；再加批量；最后加窗口。
         #   参考 GPT.generate —— 那是更慢但更直白的实现，先写它更容易建立信心。
-        raise NotImplementedError("核心任务 5：Engine.generate")
+        model = self.model
+        device = model.get_device()
+        config = model.config
+        seq_len = config.sequence_len
+        assert len(tokens) > 0, "prompt 不能为空"
+        assert len(tokens) <= seq_len, (
+            f"prompt 长度 {len(tokens)} 超过 sequence_len {seq_len}")
+
+        if max_tokens is None:
+            max_tokens = seq_len - len(tokens)
+        max_tokens = max(0, min(int(max_tokens), seq_len - len(tokens)))
+        if max_tokens == 0:
+            return
+
+        head_dim = config.n_embd // config.n_head
+        rng = torch.Generator(device=device)
+        rng.manual_seed(seed)
+
+        # 1) prompt 只前向一次，得到 batch=1 的 KV cache
+        prompt = torch.tensor(list(tokens), dtype=torch.long,
+                              device=device).unsqueeze(0)
+        prefill_cache = KVCache(1, config.n_head, seq_len, head_dim,
+                                config.n_layer, device, COMPUTE_DTYPE)
+        logits = model(prompt, kv_cache=prefill_cache)[:, -1, :]
+
+        # 2) 复制成 num_samples 份，之后每步只喂一个 token
+        cache = KVCache(num_samples, config.n_head, seq_len, head_dim,
+                        config.n_layer, device, COMPUTE_DTYPE)
+        cache.prefill(prefill_cache)
+
+        assistant_end = self.tokenizer.encode_special("<|assistant_end|>")
+        bos = self.tokenizer.get_bos_token_id()
+        completed = [False] * num_samples
+
+        for _ in range(max_tokens):
+            next_tokens = sample_next_token(logits, rng, temperature, top_k)
+            token_column = next_tokens[:, 0]
+            token_masks = torch.ones(num_samples, dtype=torch.int64)
+            yield token_column.tolist(), token_masks.tolist()
+
+            for i in range(num_samples):
+                if token_column[i].item() in (assistant_end, bos):
+                    completed[i] = True
+            if all(completed):
+                break
+
+            logits = model(next_tokens, kv_cache=cache)[:, -1, :]
     def generate_batch(self, tokens, num_samples=1, **kwargs):
         """
         Non-streaming batch generation that just returns the final token sequences.

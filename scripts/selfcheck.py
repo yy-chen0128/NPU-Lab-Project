@@ -31,6 +31,12 @@ import os
 import sys
 import traceback
 
+# 自检是 CPU 上的数值对拍：在 NPU 机器上 COMPUTE_DTYPE 默认是 bf16，
+# 会让 RoPE 频率表的 1e-5 检查、以及 selfcheck 里显式 torch.float32
+# 的 KV cache 检查失真。这里固定为 fp32；只影响本进程，不影响
+# 之后由 train.sh 另起的训练进程（它仍按设备自动选择 bf16）。
+os.environ.setdefault("NANOCHAT_DTYPE", "float32")
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch  # noqa: E402

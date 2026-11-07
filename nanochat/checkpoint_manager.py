@@ -60,12 +60,16 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
 def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
     # Load the model state
     model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
-    model_data = torch.load(model_path, map_location=device)
+    # torch>=2.6 的 torch.load 默认 weights_only=True，会拒绝 checkpoint
+    # 里合法的非张量对象（实测报 Unsupported global: getattr）。
+    # 这些都是本机训练产出的可信文件，显式关掉。
+    model_data = torch.load(model_path, map_location=device, weights_only=False)
     # Load the optimizer state if requested
     optimizer_data = None
     if load_optimizer:
         optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
-        optimizer_data = torch.load(optimizer_path, map_location=device)
+        optimizer_data = torch.load(optimizer_path, map_location=device,
+                                    weights_only=False)
     # Load the metadata
     meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
     with open(meta_path, "r", encoding="utf-8") as f:
@@ -91,6 +95,12 @@ def build_model(checkpoint_dir, step, device, phase):
         }
     # Hack: fix torch compile issue, which prepends all keys with _orig_mod.
     model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
+    # 架构开关必须与 checkpoint 一致：value embedding 是否启用由 checkpoint
+    # 里的 key 决定，否则 strict load 会因缺少/多出 value_embeds.* 而失败。
+    if any(k.startswith("value_embeds.") for k in model_data):
+        os.environ.pop("NANOCHAT_DISABLE_VE", None)
+    else:
+        os.environ["NANOCHAT_DISABLE_VE"] = "1"
     model_config_kwargs = meta_data["model_config"]
     _patch_missing_config_keys(model_config_kwargs)
     log0(f"Building model with config: {model_config_kwargs}")

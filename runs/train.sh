@@ -11,6 +11,9 @@ SEQ="${SEQ:-512}"                 # 起手语料短，用 512 就够，显存也
 DEVICE_BATCH="${DEVICE_BATCH:-16}"
 TOTAL_BATCH="${TOTAL_BATCH:-32768}"
 EVAL_EVERY="${EVAL_EVERY:-50}"
+# base_train 默认 eval_tokens=80*524288≈42M，对 11 MiB 的起步语料是
+# 十几遍验证集，首次 eval 会等很久；这里默认降到 1M，可用环境变量覆盖。
+EVAL_TOKENS="${EVAL_TOKENS:-1048576}"
 TAG="${TAG:-d${DEPTH}-zh}"
 DATA_DIR="${NANOCHAT_DATA_DIR:-$(pwd)/data/corpus}"
 
@@ -21,6 +24,11 @@ export NANOCHAT_DISABLE_COMPILE=1
 export NANOCHAT_ENFORCE_EAGER=1
 export NANOCHAT_DATA_DIR="$DATA_DIR"
 export OMP_NUM_THREADS=1
+# wandb 只做离线记录；没有登录/网络时也不会卡住
+export WANDB_MODE="${WANDB_MODE:-offline}"
+# 课程配置（configs/model_d8.yaml）关闭 value embeddings；代码默认是开启的，
+# 这里显式关闭，让参数量与手册的 ~42M（d8）对齐。想做 VE 消融就覆盖它。
+export NANOCHAT_DISABLE_VE="${NANOCHAT_DISABLE_VE:-1}"
 
 echo "=============================================================="
 echo " depth=$DEPTH  seq=$SEQ  iters=$ITERS"
@@ -49,13 +57,16 @@ fi
 # 3) 预训练
 echo
 echo "[3/3] 预训练"
-torchrun --standalone --nproc_per_node=1 -m scripts.base_train -- \
+# 平台镜像里 torchrun 在 /opt/buildtools/.../bin，未必在 PATH 上；
+# 用等价的 `python -m torch.distributed.run`，不依赖 PATH。
+python3 -m torch.distributed.run --standalone --nproc_per_node=1 -m scripts.base_train -- \
     --depth="$DEPTH" \
     --max-seq-len="$SEQ" \
     --device-batch-size="$DEVICE_BATCH" \
     --total-batch-size="$TOTAL_BATCH" \
     --num-iterations="$ITERS" \
     --eval-every="$EVAL_EVERY" \
+    --eval-tokens="$EVAL_TOKENS" \
     --sample-every=-1 \
     --save-every=200 \
     --model-tag="$TAG" \

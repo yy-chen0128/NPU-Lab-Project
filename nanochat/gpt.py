@@ -98,7 +98,19 @@ def norm(x):
     #   * 输入可能是 bf16；先转 float32 算再转回去更稳
     #
     # 一行就能写完，但请自己实现 —— 进阶挑战 1 要拿它和融合算子对比性能。
-    raise NotImplementedError("基础任务 1：实现 RMSNorm")
+    fn = _resolve_npu_rms_norm()
+    if fn is not None:
+        n = x.shape[-1]
+        key = (x.device.type, x.device.index, n, x.dtype)
+        weight = _NPU_RMS_WEIGHT_CACHE.get(key)
+        if weight is None:
+            weight = torch.ones(n, dtype=x.dtype, device=x.device)
+            _NPU_RMS_WEIGHT_CACHE[key] = weight
+        return fn(x, weight, epsilon=_RMS_EPS)[0]
+
+    xf = x.float()
+    y = xf * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + _RMS_EPS)
+    return y.to(x.dtype)
 class Linear(nn.Linear):
     """nn.Linear that casts weights to match input dtype in forward.
     Replaces autocast: master weights stay fp32 for optimizer precision,
@@ -133,7 +145,11 @@ def apply_rotary_emb(x, cos, sin):
     #   * 频率表由 _precompute_rotary_embeddings 生成（它也留空了）
     #   * 为什么 RoPE 能编码**相对**位置？见 docs/03_思考题.md 第 2 题
     #   * 注意不要就地修改输入（autograd 会不高兴）
-    raise NotImplementedError("基础任务 2：实现 RoPE")
+    x1 = x[..., 0::2]
+    x2 = x[..., 1::2]
+    y1 = x1 * cos - x2 * sin
+    y2 = x1 * sin + x2 * cos
+    return torch.stack((y1, y2), dim=-1).flatten(-2)
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -203,7 +219,39 @@ class CausalSelfAttention(nn.Module):
         #
         # 线索：flash_attn 是本仓库自己的封装（nanochat/flash_attention.py），
         #       它的基础实现（SDPA）也是你要写的 —— 两个任务在这里汇合。
-        raise NotImplementedError("核心任务 1：实现 CausalSelfAttention.forward")
+        B, T, C = x.size()
+        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
+        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+
+        if ve is not None:
+            ve = ve.view(B, T, self.n_kv_head, self.head_dim)
+            gate = 3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
+            v = v + gate.unsqueeze(-1) * ve
+
+        q = apply_rotary_emb(q, *cos_sin)
+        k = apply_rotary_emb(k, *cos_sin)
+
+        q = norm(q)
+        k = norm(k)
+
+        q = q * 1.2
+        k = k * 1.2
+
+        if kv_cache is None:
+            y = flash_attn.flash_attn_func(
+                q, k, v, causal=True, window_size=window_size)
+        else:
+            k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
+            y = flash_attn.flash_attn_with_kvcache(
+                q, k_cache, v_cache, k=k, v=v,
+                cache_seqlens=kv_cache.cache_seqlens,
+                causal=True, window_size=window_size)
+            if self.layer_idx == kv_cache.n_layers - 1:
+                kv_cache.advance(T)
+
+        y = self.c_proj(y.contiguous().view(B, T, -1))
+        return y
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -219,7 +267,9 @@ class MLP(nn.Module):
         #
         # 为什么用 ReLU²？见 docs/03_思考题.md 第 3 题。
         # 提示：它比 GELU 少一次指数运算，且在 bf16 下数值行为更简单。
-        raise NotImplementedError("基础任务 5：实现 MLP 前向")
+        x = self.c_fc(x)
+        x = F.relu(x).square()
+        return self.c_proj(x)
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -234,7 +284,9 @@ class Block(nn.Module):
         #
         # 注意参数要按顺序往下传全（ve / cos_sin / window_size / kv_cache 一个都不能丢）。
         # 提示：norm 是你写的（基础任务 1），attn 与 mlp 也在本文件里。
-        raise NotImplementedError("基础任务 6：实现 Block 前向")
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+        x = x + self.mlp(norm(x))
+        return x
 class GPT(nn.Module):
     def __init__(self, config, pad_vocab_size_to=64):
         """
@@ -364,7 +416,20 @@ class GPT(nn.Module):
         #     位置范围越远 —— 调它是个可以做的实验（docs/03_思考题.md 第 2 题）
         #   * device 参数别忘，否则表建在 CPU 上、前向时设备不匹配
         #   * 频率建议用 float32 算，最后再转 COMPUTE_DTYPE（数值更稳）
-        raise NotImplementedError("基础任务 3：实现 RoPE 频率表")
+        if device is None:
+            if hasattr(self, "transformer"):
+                device = self.transformer.wte.weight.device
+            else:
+                device = torch.device("cpu")
+
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, head_dim, 2, device=device,
+                                  dtype=torch.float32) / head_dim))
+        t = torch.arange(seq_len, device=device, dtype=torch.float32)
+        angles = torch.outer(t, inv_freq)
+        cos = torch.cos(angles).reshape(1, seq_len, 1, head_dim // 2).to(COMPUTE_DTYPE)
+        sin = torch.sin(angles).reshape(1, seq_len, 1, head_dim // 2).to(COMPUTE_DTYPE)
+        return cos, sin
     def _compute_window_sizes(self, config):
         """
         Compute per-layer window sizes for sliding window attention.
@@ -623,7 +688,71 @@ class GPT(nn.Module):
         #
         # 自检会同时检查：logits 形状、|logits| <= 15、loss 有限、
         # "mean" 与 "none".mean() 一致、以及增量解码与全序列前向一致。
-        raise NotImplementedError("核心任务 8：实现 GPT.forward")
+        B, T = idx.size()
+        T0 = 0 if kv_cache is None else kv_cache.get_pos()
+
+        assert T0 + T <= self.cos.size(1), (
+            f"序列长度 {T0 + T} 超过 RoPE 缓存 {self.cos.size(1)}"
+            f"（rotary_seq_len={self.rotary_seq_len}）")
+        assert idx.device == self.transformer.wte.weight.device, (
+            f"idx 在 {idx.device}，模型在 {self.transformer.wte.weight.device}")
+        assert self.cos.dtype == COMPUTE_DTYPE, (
+            f"RoPE 表 dtype {self.cos.dtype} != COMPUTE_DTYPE {COMPUTE_DTYPE}")
+
+        cos_sin = self.cos[:, T0:T0 + T], self.sin[:, T0:T0 + T]
+
+        x = self.transformer.wte(idx)
+        x = x.to(COMPUTE_DTYPE)
+        x = norm(x)
+
+        # Smear: 把上一个 token 的嵌入混入当前位置
+        if kv_cache is None:
+            # 训练 / 朴素生成：整段都在手上，直接切片
+            gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(
+                self.smear_gate(x[:, 1:, :24]))
+            x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
+        else:
+            # KV cache 推理：从 cache 读上一个嵌入，同时存下当前这个
+            x_pre_smear = kv_cache.prev_embedding
+            kv_cache.prev_embedding = x[:, -1:, :]
+            if T > 1:
+                # prefill：与训练相同，位置 1 起才做 smear
+                gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(
+                    self.smear_gate(x[:, 1:, :24]))
+                x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
+            elif x_pre_smear is not None:
+                # 单 token 解码：用 cache 里的上一个嵌入
+                gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(
+                    self.smear_gate(x[:, :, :24]))
+                x = x + gate * x_pre_smear
+
+        x0 = x
+        x_backout = None
+        backout_layer = self.config.n_layer // 2
+        for i, block in enumerate(self.transformer.h):
+            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            ve = (self.value_embeds[str(i)](idx).to(x.dtype)
+                  if str(i) in self.value_embeds else None)
+            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            if i == backout_layer:
+                x_backout = x
+
+        if x_backout is not None:
+            x = x - self.backout_lambda.to(x.dtype) * x_backout
+
+        x = norm(x)
+        logits = self.lm_head(x)
+        logits = logits[..., :self.config.vocab_size]
+        logits = logits.float()
+        logits = 15 * torch.tanh(logits / 15)
+
+        if targets is not None:
+            return F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=-1,
+                reduction=loss_reduction)
+        return logits
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):
         """
@@ -649,4 +778,22 @@ class GPT(nn.Module):
         #   * rng 必须由 seed 构造（torch.Generator(device=...) + manual_seed(seed)），
         #     否则同一 seed 不可复现，实验之间无法对比
         #   * 这个函数在 __init__ 里被标记为 @torch.inference_mode()，别把梯度带进来
-        raise NotImplementedError("进阶任务：实现朴素采样式生成")
+        from nanochat.engine import sample_next_token
+
+        if torch.is_tensor(tokens):
+            tokens = tokens.flatten().tolist()
+        device = self.get_device()
+        idx = torch.tensor(list(tokens), dtype=torch.long,
+                           device=device).unsqueeze(0)
+        rng = torch.Generator(device=device)
+        rng.manual_seed(seed)
+
+        for _ in range(max_tokens):
+            if idx.size(1) >= self.config.sequence_len:
+                raise RuntimeError(
+                    f"naive generate 达到 sequence_len={self.config.sequence_len}；"
+                    f"请减小 max_tokens")
+            logits = self(idx)[:, -1, :]
+            idx_next = sample_next_token(logits, rng, temperature, top_k)
+            idx = torch.cat([idx, idx_next], dim=1)
+            yield int(idx_next.item())

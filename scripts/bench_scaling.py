@@ -42,6 +42,10 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# 与 runs/train.sh 保持一致：课程配置关闭 value embeddings。
+# 否则 plan 里的参数量会多出 value_embeds（d8 约 +25M），scaling 横轴就不对了。
+os.environ.setdefault("NANOCHAT_DISABLE_VE", "1")
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RESULTS = os.path.join(REPO, "scaling_results.jsonl")
 

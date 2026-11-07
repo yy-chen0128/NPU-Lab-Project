@@ -11,11 +11,25 @@ venv/
 
 # 训练产物 / 缓存
 runs/*.log
+*.log
 scaling_results.jsonl
 base_checkpoints/
 *.pt
 *.pth
 *.safetensors
+wandb/
+
+# 实验报告 / 提交物 / 截图：只跟踪代码，这些不进仓库
+实验报告*
+实验*提交*
+报告/
+reports/
+*.pdf
+*.docx
+*.pptx
+*.png
+*.jpg
+*.jpeg
 
 # 云盘大包与归档（用 runs/fetch_data.sh 下载，不进仓库）
 data/packed/

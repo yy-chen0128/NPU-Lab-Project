@@ -20,6 +20,17 @@ Good old AdamW optimizer, fused kernel.
 https://arxiv.org/abs/1711.05101
 """
 
+def _scalar_for(t: Tensor, ref: Tensor) -> Tensor:
+    """0-D CPU 标量 -> ref 的设备。
+
+    torch_npu 的 `lerp_` 不接受跨设备的 0-D 标量（CUDA 可以），
+    而本优化器刻意用 0-D CPU 张量存超参以避免重编译。这里只在
+    NPU 上做一次设备搬移，CUDA 路径保持原样。
+    """
+    if ref.device.type == "npu":
+        return t.to(ref.device)
+    return t
+
 @maybe_compile
 def adamw_step_fused(
     p: Tensor,              # (32768, 768) - parameter tensor
@@ -48,8 +59,8 @@ def adamw_step_fused(
     # Weight decay (decoupled, applied before the update)
     p32.mul_(1 - lr_t * wd_t)
     # Update running averages (lerp_ is cleaner and fuses well)
-    exp_avg32.lerp_(grad32, 1 - beta1_t)
-    exp_avg_sq32.lerp_(grad32.square(), 1 - beta2_t)
+    exp_avg32.lerp_(grad32, _scalar_for(1 - beta1_t, exp_avg32))
+    exp_avg_sq32.lerp_(grad32.square(), _scalar_for(1 - beta2_t, exp_avg_sq32))
     # Bias corrections
     bias1 = 1 - beta1_t ** step_t
     bias2 = 1 - beta2_t ** step_t
@@ -128,7 +139,7 @@ def muon_step_fused(
     """
 
     # Nesterov momentum
-    momentum = momentum_t.to(stacked_grads.dtype)
+    momentum = _scalar_for(momentum_t.to(stacked_grads.dtype), stacked_grads)
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
     g = stacked_grads.lerp_(momentum_buffer, momentum)
 
@@ -161,7 +172,7 @@ def muon_step_fused(
     g = g * (target_norm / current_norm).to(g.dtype)
 
     # Variance reduction
-    beta2 = beta2_t.to(g.dtype)
+    beta2 = _scalar_for(beta2_t.to(g.dtype), g)
     v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
     red_dim_size = g.size(red_dim)
     v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size

@@ -113,7 +113,32 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
     #     （True 表示屏蔽）—— 进阶挑战 1 里这是个坑
     #   * enable_gqa 由调用方算好传进来（本模型 n_kv_head == n_head，实际是 False）
     #   * window 取 window_size[0]；本实现只支持左窗（右窗恒为 0）
-    raise NotImplementedError("核心任务 2：用 SDPA 实现注意力")
+    B, H, Tq, D = q.shape
+    window = window_size[0]
+    Tk = k.size(2)
+
+    # ① 全长 + Tq == Tk：走 PyTorch 自己的融合内核
+    if window < 0 and Tq == Tk:
+        return F.scaled_dot_product_attention(
+            q, k, v, is_causal=True, enable_gqa=enable_gqa)
+
+    # ② 单 token 生成：没有 query 维度上的因果，只需按窗口裁掉左边的 K/V
+    if Tq == 1:
+        if window >= 0:
+            start = max(0, Tk - (window + 1))
+            k = k[:, :, start:, :]
+            v = v[:, :, start:, :]
+        return F.scaled_dot_product_attention(
+            q, k, v, is_causal=False, enable_gqa=enable_gqa)
+
+    # ③ 其余情况（滑窗训练、chunk 推理）：显式构造 bool mask
+    row = (Tk - Tq) + torch.arange(Tq, device=q.device).unsqueeze(1)
+    col = torch.arange(Tk, device=q.device).unsqueeze(0)
+    mask = col <= row
+    if window >= 0:
+        mask = mask & ((row - col) <= window)
+    return F.scaled_dot_product_attention(
+        q, k, v, attn_mask=mask, is_causal=False, enable_gqa=enable_gqa)
 # =============================================================================
 # NPU 融合注意力（torch_npu.npu_fusion_attention）
 # =============================================================================
@@ -245,7 +270,20 @@ def _npu_causal_mask(seq_len: int, device):
     #       所以即使只想要滑窗也必须传 mask。
     #
     # 提示：结果按 (device, NPU_FA_MASK_SIZE) 缓存，别每层都重建。
-    raise NotImplementedError("进阶挑战 1a：构造融合注意力的 mask")
+    device = torch.device(device)
+    if seq_len > NPU_FA_MASK_SIZE:
+        raise ValueError(
+            f"序列长度 {seq_len} 超过昇腾融合注意力的 mask 尺寸 "
+            f"{NPU_FA_MASK_SIZE}；请调大 NANOCHAT_NPU_FA_MASK_SIZE")
+
+    key = (device.type, device.index, NPU_FA_MASK_SIZE)
+    mask = _NPU_MASK_CACHE.get(key)
+    if mask is None:
+        # True = 屏蔽；上三角（不含对角线）对应因果
+        mask = torch.ones(NPU_FA_MASK_SIZE, NPU_FA_MASK_SIZE,
+                          dtype=torch.bool, device=device).triu(diagonal=1)
+        _NPU_MASK_CACHE[key] = mask
+    return mask
 def _should_use_npu_fa(window_size, seq_len: int) -> bool:
     """
     这一层该不该用融合算子。
@@ -292,7 +330,36 @@ def _npu_attention(q, k, v, window_size):
     #   3) 实测并报告加速比（scripts/bench_attention.py）。
     #
     # 配置从 npu_fa_config() 读（环境变量优先），便于不改代码就换参数。
-    raise NotImplementedError("进阶挑战 1b：接入 npu_fusion_attention")
+    if _npu_fa is None:
+        raise RuntimeError(
+            "NANOCHAT_ATTN_IMPL=npu_fa 但 torch_npu.npu_fusion_attention 不可用")
+
+    B, T, H, D = q.shape
+    window = window_size[0]
+    cfg = npu_fa_config()
+    mask = _npu_causal_mask(T, q.device)
+    scale = 1.0 / math.sqrt(D)
+
+    # 全长层：top-left causal（sparse_mode=2）
+    # 注意：**必须传 atten_mask**。实测不传时 sparse_mode / pre_tockens
+    # 都被忽略，算子退化成非因果注意力（结果静默错误）。
+    if window < 0 or window >= T:
+        return _npu_fa(q, k, v, head_num=H, input_layout="BSND",
+                       atten_mask=mask, scale=scale, sparse_mode=2)[0]
+
+    # 滑窗层：band 模式（sparse_mode=4）+ pre_tockens
+    # 实测 pre_tockens=window、next_tockens=0 与 SDPA 的
+    # (row - col) <= window 语义一致。
+    pre_tokens = cfg["pre_tokens"]
+    if pre_tokens is None or pre_tokens == "":
+        pre_tokens = window
+    else:
+        pre_tokens = int(pre_tokens)
+    return _npu_fa(q, k, v, head_num=H, input_layout="BSND",
+                   atten_mask=mask, scale=scale,
+                   pre_tockens=pre_tokens,
+                   next_tockens=int(cfg["next_tokens"]),
+                   sparse_mode=4)[0]
 # =============================================================================
 # Public API: Same interface as FA3
 # =============================================================================
@@ -325,7 +392,19 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
     #
     # 提示：_should_use_npu_fa 已经写好，它**只对真的有滑窗的层**返回 True ——
     #       实测全长层用融合算子反而慢（0.74×），原因见 docs/02_进阶挑战.md 的挑战 1。
-    raise NotImplementedError("核心任务 3：flash_attn_func 的转置与分发")
+    if USE_FA3:
+        return _fa3.flash_attn_func(q, k, v, causal=causal,
+                                    window_size=window_size)
+
+    enable_gqa = k.size(2) != q.size(2)
+    impl = attn_impl()
+    if impl == "npu_fa" and _should_use_npu_fa(window_size, q.size(1)):
+        return _npu_attention(q, k, v, window_size)
+
+    # SDPA 吃 (B, H, T, D)，去/回各转置一次
+    return _sdpa_attention(
+        q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+        window_size, enable_gqa).transpose(1, 2)
 def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=None,
                             causal=False, window_size=(-1, -1)):
     """
@@ -358,7 +437,24 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
     #
     # 提示：滑窗推理只需最后 window+1 个 key —— 这正是短窗层能省 KV 读取的原因，
     #       也是 docs/02_进阶挑战.md 的挑战 2 里分析推理效率的切入点。
-    raise NotImplementedError("核心任务 4：带 KV cache 的推理注意力")
+    T_new = q.size(1)
+    pos = int(cache_seqlens[0].item())
+    end = pos + T_new
+    if end > k_cache.size(1):
+        raise ValueError(
+            f"KV cache 越界：写入到 {end}，容量只有 {k_cache.size(1)}")
+
+    if k is not None:
+        k_cache[:, pos:end, :, :] = k
+        v_cache[:, pos:end, :, :] = v
+
+    k_all = k_cache[:, :end]
+    v_all = v_cache[:, :end]
+    enable_gqa = k_all.size(2) != q.size(2)
+    y = _sdpa_attention(
+        q.transpose(1, 2), k_all.transpose(1, 2), v_all.transpose(1, 2),
+        window_size, enable_gqa)
+    return y.transpose(1, 2)
 # =============================================================================
 # Export: flash_attn module interface (drop-in replacement for FA3)
 # =============================================================================
