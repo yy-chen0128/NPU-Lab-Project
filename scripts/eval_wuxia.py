@@ -113,7 +113,7 @@ def main() -> int:
     specs = [
         ("base", "d6-zh", None, "基座 d6"),
         ("base", "wuxia-dapt", 500, "DAPT"),
-        ("sft", "wuxia-sft", 800, "SFT"),
+        ("sft", "wuxia-sft", None, "SFT"),
     ]
     models = []
     for source, tag, step, label in specs:
